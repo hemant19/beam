@@ -75,6 +75,7 @@ import org.apache.http.conn.ssl.TrustSelfSignedStrategy;
 import org.apache.http.entity.BufferedHttpEntity;
 import org.apache.http.entity.ContentType;
 import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.impl.nio.client.HttpAsyncClientBuilder;
 import org.apache.http.nio.conn.ssl.SSLIOSessionStrategy;
 import org.apache.http.nio.entity.NStringEntity;
 import org.apache.http.ssl.SSLContexts;
@@ -386,6 +387,21 @@ public class ElasticsearchIO {
       builder.addIfNotNull(DisplayData.item("connectTimeout", getConnectTimeout()));
     }
 
+    private SSLContext createSSLContext(String keystorePath) throws IOException {
+      try {
+        KeyStore keyStore = KeyStore.getInstance("jks");
+        try (InputStream is = new FileInputStream(new File(keystorePath))) {
+          String keystorePassword = getKeystorePassword();
+          keyStore.load(is, (keystorePassword == null) ? null : keystorePassword.toCharArray());
+        }
+        return SSLContexts.custom()
+            .loadTrustMaterial(keyStore, new TrustSelfSignedStrategy())
+            .build();
+      } catch (Exception e) {
+        throw new IOException("Can't load the client certificate from the keystore", e);
+      }
+    }
+
     @VisibleForTesting
     RestClient createClient() throws IOException {
       HttpHost[] hosts = new HttpHost[getAddresses().size()];
@@ -396,33 +412,32 @@ public class ElasticsearchIO {
         i++;
       }
       RestClientBuilder restClientBuilder = RestClient.builder(hosts);
-      if (getUsername() != null) {
-        final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
-        credentialsProvider.setCredentials(
-            AuthScope.ANY, new UsernamePasswordCredentials(getUsername(), getPassword()));
-        restClientBuilder.setHttpClientConfigCallback(
-            httpAsyncClientBuilder ->
-                httpAsyncClientBuilder.setDefaultCredentialsProvider(credentialsProvider));
-      }
-      if (getKeystorePath() != null && !getKeystorePath().isEmpty()) {
-        try {
-          KeyStore keyStore = KeyStore.getInstance("jks");
-          try (InputStream is = new FileInputStream(new File(getKeystorePath()))) {
-            String keystorePassword = getKeystorePassword();
-            keyStore.load(is, (keystorePassword == null) ? null : keystorePassword.toCharArray());
-          }
-          final SSLContext sslContext =
-              SSLContexts.custom()
-                  .loadTrustMaterial(keyStore, new TrustSelfSignedStrategy())
-                  .build();
-          final SSLIOSessionStrategy sessionStrategy = new SSLIOSessionStrategy(sslContext);
-          restClientBuilder.setHttpClientConfigCallback(
-              httpClientBuilder ->
-                  httpClientBuilder.setSSLContext(sslContext).setSSLStrategy(sessionStrategy));
-        } catch (Exception e) {
-          throw new IOException("Can't load the client certificate from the keystore", e);
-        }
-      }
+      final SSLContext sslContext =
+          (getKeystorePath() != null && !getKeystorePath().isEmpty())
+              ? createSSLContext(getKeystorePath())
+              : null;
+
+      restClientBuilder.setHttpClientConfigCallback(
+          new RestClientBuilder.HttpClientConfigCallback() {
+            @Override
+            public HttpAsyncClientBuilder customizeHttpClient(
+                HttpAsyncClientBuilder httpAsyncClientBuilder) {
+              if (getUsername() != null) {
+                final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
+                credentialsProvider.setCredentials(
+                    AuthScope.ANY, new UsernamePasswordCredentials(getUsername(), getPassword()));
+                httpAsyncClientBuilder.setDefaultCredentialsProvider(credentialsProvider);
+              }
+
+              if (sslContext != null) {
+                httpAsyncClientBuilder
+                    .setSSLContext(sslContext)
+                    .setSSLStrategy(new SSLIOSessionStrategy(sslContext));
+              }
+
+              return httpAsyncClientBuilder;
+            }
+          });
       restClientBuilder.setRequestConfigCallback(
           new RestClientBuilder.RequestConfigCallback() {
             @Override
